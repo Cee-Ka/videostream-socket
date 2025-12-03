@@ -60,15 +60,23 @@ class ServerWorker:
 					self.state = self.READY
 				except IOError:
 					self.replyRtsp(self.FILE_NOT_FOUND_404, seq[1])
+					return
 				
 				# Generate a randomized RTSP session ID
 				self.clientInfo['session'] = randint(100000, 999999)
 				
+				# Get the RTP/UDP port from the last line
+				try:
+					# Expect line like: "Transport: RTP/UDP; client_port=5004"
+					transport_parts = request[2].split()
+					client_port_field = transport_parts[-1]
+					self.clientInfo['rtpPort'] = client_port_field.split('=')[1]
+				except Exception:
+					self.replyRtsp(self.CON_ERR_500, seq[1])
+					return
+
 				# Send RTSP reply
 				self.replyRtsp(self.OK_200, seq[1])
-				
-				# Get the RTP/UDP port from the last line
-				self.clientInfo['rtpPort'] = request[2].split(' ')[3]
 		
 		# Process PLAY request 		
 		elif requestType == self.PLAY:
