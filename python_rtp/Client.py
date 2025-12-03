@@ -1,4 +1,4 @@
-from tkinter import *
+from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
