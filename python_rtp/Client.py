@@ -2,6 +2,7 @@ from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
+import io 
 
 from RtpPacket import RtpPacket
 
@@ -34,9 +35,15 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+		self.recvBuffer = b""  # accumulate RTP payloads for SOI/EOI parsing
+		self.firstFrame = True
 		
 	def createWidgets(self):
 		"""Build GUI."""
+		# Allow widgets to expand with the window
+		self.master.rowconfigure(0, weight=1)
+		for i in range(4):
+			self.master.columnconfigure(i, weight=1)
 		# Create Setup button
 		self.setup = Button(self.master, width=20, padx=3, pady=3)
 		self.setup["text"] = "Setup"
@@ -61,8 +68,8 @@ class Client:
 		self.teardown["command"] =  self.exitClient
 		self.teardown.grid(row=1, column=3, padx=2, pady=2)
 		
-		# Create a label to display the movie
-		self.label = Label(self.master, height=19)
+		# Create a label to display the movie (size will fit incoming frame)
+		self.label = Label(self.master)
 		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
 	
 	def setupMovie(self):
@@ -74,7 +81,7 @@ class Client:
 		"""Teardown button handler."""
 		self.sendRtspRequest(self.TEARDOWN)		
 		self.master.destroy() # Close the gui window
-		os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		# os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
 
 	def pauseMovie(self):
 		"""Pause button handler."""
@@ -91,46 +98,74 @@ class Client:
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
-		"""Listen for RTP packets."""
+		"""Listen for RTP packets, reassemble JPEG frames using SOI/EOI markers."""
+		SOI = b'\xff\xd8'
+		EOI = b'\xff\xd9'
 		while True:
 			try:
-				data = self.rtpSocket.recv(20480)
+				data = self.rtpSocket.recv(65535)
 				if data:
 					rtpPacket = RtpPacket()
 					rtpPacket.decode(data)
 					
-					currFrameNbr = rtpPacket.seqNum()
-					print("Current Seq Num: " + str(currFrameNbr))
+					payload = rtpPacket.getPayload()
+					seq = rtpPacket.seqNum()
+					# marker = rtpPacket.getMarker()  # optional debug
+					print(f"RTP packet seq={seq}, payload={len(payload)} bytes")
 										
-					if currFrameNbr > self.frameNbr: # Discard the late packet
-						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+					# Append payload to buffer
+					self.recvBuffer += payload
+
+					while True:
+						soi = self.recvBuffer.find(SOI)
+						if soi == -1:
+							if len(self.recvBuffer) > 2_000_000:
+								self.recvBuffer = b""
+							break
+
+						eoi = self.recvBuffer.find(EOI)
+						if eoi == -1:
+							break
+						
+						frame = self.recvBuffer[soi: eoi + 2]
+						self.recvBuffer = self.recvBuffer[eoi + 2:]
+
+						self.frameNbr += 1
+						print(f"Completed frame #{self.frameNbr}, size={len(frame)} bytes")
+						self.updateMovie(frame)
+
 			except:
-				# Stop listening upon requesting PAUSE or TEARDOWN
-				if self.playEvent.isSet(): 
+				if self.playEvent.isSet():
 					break
 				
-				# Upon receiving ACK for TEARDOWN request,
-				# close the RTP socket
 				if self.teardownAcked == 1:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
 					break
-					
-	def writeFrame(self, data):
-		"""Write the received frame to a temp image file. Return the image file."""
-		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-		file = open(cachename, "wb")
-		file.write(data)
-		file.close()
+	# def writeFrame(self, data):
+	# 	"""Write the received frame to a temp image file. Return the image file."""
+	# 	cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+	# 	file = open(cachename, "wb")
+	# 	file.write(data)
+	# 	file.close()
 		
-		return cachename
+	# 	return cachename
 	
-	def updateMovie(self, imageFile):
+	def updateMovie(self, jpeg_bytes):
 		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
-		self.label.image = photo
+		image = Image.open(io.BytesIO(jpeg_bytes))
+		image = image.convert("RGB")
+		photo = ImageTk.PhotoImage(image)
+		
+		self.label.configure(image = photo, width=image.width, height=image.height) 
+		self.label.image = photo # type: ignore
+		if self.firstFrame:
+			# Resize window to fit content once.
+			total_height = image.height + self.setup.winfo_reqheight() + 20
+			total_width = max(image.width, self.master.winfo_width())
+			self.master.minsize(total_width, total_height)
+			self.master.geometry(f"{total_width}x{total_height}")
+			self.firstFrame = False
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""

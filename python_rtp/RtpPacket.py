@@ -8,21 +8,17 @@ class RtpPacket:
 	def __init__(self):
 		pass
 		
-	def encode(self, version, padding, extension, cc, seqnum, marker, pt, ssrc, payload):
+	def encode(self, version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, timestamp=None):
 		"""Encode the RTP packet with header fields and payload."""
-		timestamp = int(time())
+		if timestamp is None:
+			# Use 90kHz clock for video
+			timestamp = int(time() * 90000)
 		header = bytearray(HEADER_SIZE)
-		version = 2
-		padding = 0
-		extension = 0
-		cc = 0
-		marker = 0
-		pt = 26 # Payload type for MJPEG
 		#--------------
 		# Fill the header bytearray with RTP header fields
 		
 		header[0] = (version << 6) | (padding << 5) | (extension << 4) | cc
-		header[1] = (marker << 7) | pt
+		header[1] = ((marker & 0x01) << 7) | (pt & 0x7F)
 		header[2] = (seqnum >> 8) & 0xFF
 		header[3] = (seqnum & 0xFF)
 
@@ -71,3 +67,7 @@ class RtpPacket:
 	def getPacket(self):
 		"""Return RTP packet."""
 		return self.header + self.payload
+	
+	def getMarker(self):
+		"""Return marker bit (0 or 1)."""
+		return (self.header[1] & 0x80) >> 7
