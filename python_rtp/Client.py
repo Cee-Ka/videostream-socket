@@ -2,7 +2,8 @@ from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
-
+import queue
+import glob
 from RtpPacket import RtpPacket
 
 CACHE_FILE_NAME = "cache-"
@@ -34,6 +35,9 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+		self.buffer = queue.Queue(maxsize=200)
+		self.BUFFER_THRESHOLD = 40
+		self.isPlayingBufferd = False
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -79,6 +83,7 @@ class Client:
 	def pauseMovie(self):
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
+			self.isPlayingBuffered = False
 			self.sendRtspRequest(self.PAUSE)
 	
 	def playMovie(self):
@@ -88,6 +93,11 @@ class Client:
 			threading.Thread(target=self.listenRtp).start()
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
+			if not self.buffer.empty():
+				self.isPlayingBuffered = True
+			else:
+				self.isPlayingBuffered = False
+			self.run_buffer()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -104,7 +114,9 @@ class Client:
 										
 					if currFrameNbr > self.frameNbr: # Discard the late packet
 						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+						frame_name = self.writeFrame(rtpPacket.getPayload())
+						if not self.buffer.full():
+								self.buffer.put(frame_name)
 			except:
 				# Stop listening upon requesting PAUSE or TEARDOWN
 				if self.playEvent.isSet(): 
@@ -118,20 +130,25 @@ class Client:
 					break
 					
 	def writeFrame(self, data):
-		"""Write the received frame to a temp image file. Return the image file."""
-		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-		file = open(cachename, "wb")
-		file.write(data)
-		file.close()
-		
-		return cachename
+			"""Write the received frame to a temp image file. Return the image file."""
+			cachename = CACHE_FILE_NAME + str(self.sessionId) + "-" + str(self.frameNbr) + CACHE_FILE_EXT
+			
+			file = open(cachename, "wb")
+			file.write(data)
+			file.close()
+			
+			return cachename
 	
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
-		self.label.image = photo
-		
+		try:
+			photo = ImageTk.PhotoImage(Image.open(imageFile))
+			self.label.configure(image = photo, height=288) 
+			self.label.image = photo
+		except Exception as e:
+			print(f"Warning: Bad frame skipped ({imageFile}) - {e}")
+			return
+
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
 		self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -172,8 +189,7 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.PLAY
-		
-		# Pause request
+			
 		elif requestCode == self.PAUSE and self.state == self.PLAYING:
 			# Update RTSP sequence number.
 			self.rtspSeq += 1
@@ -198,6 +214,13 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.TEARDOWN
+			try:
+				file_list = glob.glob(CACHE_FILE_NAME + "*")
+				for f in file_list:
+					os.remove(f)
+				print(f"Cleaned up {len(file_list)} cache files.")
+			except Exception as e:
+				print(f"Error cleaning up cache: {e}")
 		else:
 			return
 		
@@ -281,3 +304,23 @@ class Client:
 			self.exitClient()
 		else: # When the user presses cancel, resume playing.
 			self.playMovie()
+
+	def run_buffer(self):
+		"""Take frames from buffer to display"""
+		if self.state != self.TEARDOWN:
+			# --- PRE-BUFFERING ---
+			if not self.isPlayingBufferd:
+				if self.buffer.qsize() >= self.BUFFER_THRESHOLD:
+					self.isPlayingBufferd = True
+					print("Buffering Complete! Starting Playback...")
+				else:
+					print(f"Buffering... {self.buffer.qsize()}/{self.BUFFER_THRESHOLD}")
+			# ---  PLAYBACK  ---
+			if self.isPlayingBufferd:
+				if not self.buffer.empty():
+					frame_name = self.buffer.get()
+					self.updateMovie(frame_name)
+				else:
+					print("Buffer empty! Waiting for packets...")
+					self.isPlayingBuffered = False
+			self.master.after(50, self.run_buffer)
