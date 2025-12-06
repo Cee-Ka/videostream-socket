@@ -100,9 +100,9 @@ class Client:
 		if self.state == self.READY:
 			# Create a new thread to listen for RTP packets
 			print("Resuming Server & Display...")
+			threading.Thread(target=self.listenRtp).start()
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
-			threading.Thread(target=self.listenRtp, daemon=True).start()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -149,13 +149,9 @@ class Client:
 	
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
-		try:
-			photo = ImageTk.PhotoImage(Image.open(imageFile))
-			self.label.configure(image = photo, height=288) 
-			self.label.image = photo
-		except Exception as e:
-			print(f"Warning: Bad frame skipped ({imageFile}) - {e}")
-			return
+		photo = ImageTk.PhotoImage(Image.open(imageFile))
+		self.label.configure(image = photo, height=288) 
+		self.label.image = photo
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
@@ -175,6 +171,7 @@ class Client:
 		if requestCode == self.SETUP and self.state == self.INIT:
 			threading.Thread(target=self.recvRtspReply).start()
 			# Update RTSP sequence number.
+			self.run_buffer()
 			self.rtspSeq += 1
 			
 			# Write the RTSP request to be sent.
@@ -272,9 +269,6 @@ class Client:
 						
 						# Open RTP port.
 						self.openRtpPort() 
-						if not getattr(self, "_buffer_running", False):
-							self._buffer_running = True
-							self.master.after(0, self.run_buffer)
 					elif self.requestSent == self.PLAY:
 						self.state = self.PLAYING
 					elif self.requestSent == self.PAUSE:
@@ -314,38 +308,33 @@ class Client:
 			self.playMovie()
 
 	def run_buffer(self):
-		"""Hàm xả hàng (Consumer) - Phiên bản YouTube Style"""
-		# Nếu client đã teardown thì dừng luôn
-		if self.state == self.TEARDOWN:
-			return
+			"""Hàm xả hàng (Consumer) - Phiên bản YouTube Style"""
+			if self.state != self.TEARDOWN:
+				
+				# --- LOGIC 1: TỰ ĐỘNG BẬT KHI ĐỦ HÀNG (AUTO-START) ---
+				# Chỉ tự động bật nếu:
+				# 1. Chưa được chiếu (isPlayingBuffered = False)
+				# 2. VÀ quan trọng nhất: Người dùng KHÔNG bấm Pause (user_paused = False)
+				if not self.isPlayingBuffered and not self.user_paused:
+					if self.buffer.qsize() >= self.BUFFER_THRESHOLD:
+						self.isPlayingBuffered = True
+						print("Buffering Complete! Starting playback...")
+					else:
+						# In ra để debug (tùy chọn)
+						print(f"Buffering... {self.buffer.qsize()}/{self.BUFFER_THRESHOLD}")
+						pass
 
-		# --- AUTO START: chỉ khi chưa đang chiếu và user không pause
-		if not self.isPlayingBuffered and not self.user_paused:
-			if self.buffer.qsize() >= self.BUFFER_THRESHOLD:
-				self.isPlayingBuffered = True
-				print("Buffering Complete! Starting playback...")
-			else:
-				# debug
-				print(f"Buffering... {self.buffer.qsize()}/{self.BUFFER_THRESHOLD}")
-				pass
+				# --- LOGIC 2: HIỂN THỊ HÌNH ẢNH ---
+				if self.isPlayingBuffered:
+					if not self.buffer.empty():
+						frame_name = self.buffer.get()
+						self.updateMovie(frame_name)
+					else:
+						# Nếu đang chiếu mà hết hàng -> Tạm dừng để load tiếp
+						# Nhưng nếu đang Pause (user_paused) thì không báo lỗi
+						if not self.user_paused:
+							print("Buffer empty! Re-buffering...")
+							self.isPlayingBuffered = False
 
-		# --- HIỂN THỊ HÌNH ẢNH (consumer)
-		if self.isPlayingBuffered and not self.user_paused:
-			try:
-				frame_name = self.buffer.get_nowait()
-			except queue.Empty:
-				# hết hàng → tạm dừng playback
-				if not self.user_paused:
-					print("Buffer empty! Re-buffering...")
-					self.isPlayingBuffered = False
-			else:
-				# show frame (note: consider delete file after show)
-				self.updateMovie(frame_name)
-				# optional: delete file to save disk
-				try:
-					os.remove(frame_name)
-				except:
-					pass
-
-		# schedule tiếp
-		self.master.after(50, self.run_buffer)
+				# Lặp lại sau 50ms
+				self.master.after(50, self.run_buffer)
