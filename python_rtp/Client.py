@@ -100,9 +100,9 @@ class Client:
 		if self.state == self.READY:
 			# Create a new thread to listen for RTP packets
 			print("Resuming Server & Display...")
-			threading.Thread(target=self.listenRtp).start()
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
+			threading.Thread(target=self.listenRtp, daemon=True).start()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -308,33 +308,37 @@ class Client:
 			self.playMovie()
 
 	def run_buffer(self):
-			"""Hàm xả hàng (Consumer) - Phiên bản YouTube Style"""
+			"""(Consumer) - YouTube Style"""
 			if self.state != self.TEARDOWN:
 				
-				# --- LOGIC 1: TỰ ĐỘNG BẬT KHI ĐỦ HÀNG (AUTO-START) ---
-				# Chỉ tự động bật nếu:
-				# 1. Chưa được chiếu (isPlayingBuffered = False)
-				# 2. VÀ quan trọng nhất: Người dùng KHÔNG bấm Pause (user_paused = False)
+				# --- AUTO-START WHEN BUFFER IS READY ---
+				# Auto-start playback only when BOTH conditions are true:
+				# 1. Playback is not currently running (isPlayingBuffered = False)
+				# 2. User did NOT press Pause (user_paused = False)
 				if not self.isPlayingBuffered and not self.user_paused:
 					if self.buffer.qsize() >= self.BUFFER_THRESHOLD:
 						self.isPlayingBuffered = True
 						print("Buffering Complete! Starting playback...")
 					else:
-						# In ra để debug (tùy chọn)
 						print(f"Buffering... {self.buffer.qsize()}/{self.BUFFER_THRESHOLD}")
 						pass
 
-				# --- LOGIC 2: HIỂN THỊ HÌNH ẢNH ---
+				# --- DISPLAY FRAMES FROM BUFFER ---
 				if self.isPlayingBuffered:
 					if not self.buffer.empty():
 						frame_name = self.buffer.get()
 						self.updateMovie(frame_name)
+						# Remove cached temp file after displaying the frame
+						try:
+							os.remove(frame_name)
+						except:
+							pass
 					else:
-						# Nếu đang chiếu mà hết hàng -> Tạm dừng để load tiếp
-						# Nhưng nếu đang Pause (user_paused) thì không báo lỗi
+						# If playback is running but buffer becomes empty → rebuffer
+						# But if the user manually paused, do NOT print warnings
 						if not self.user_paused:
 							print("Buffer empty! Re-buffering...")
 							self.isPlayingBuffered = False
 
-				# Lặp lại sau 50ms
+				# Schedule the next buffer step in 50ms
 				self.master.after(50, self.run_buffer)
