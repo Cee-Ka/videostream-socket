@@ -3,10 +3,12 @@ import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
 import io 
-
+import os
 import queue,glob
 from RtpPacket import RtpPacket
 
+CACHE_DIR = "cache_frames"
+os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
 
@@ -84,7 +86,8 @@ class Client:
 	
 	def exitClient(self):
 		"""Teardown button handler."""
-		self.sendRtspRequest(self.TEARDOWN)		
+		if self.sessionId and self.rtspSocket:
+			self.sendRtspRequest(self.TEARDOWN)		
 		self.master.destroy() # Close the gui window
 		# os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
 
@@ -94,7 +97,7 @@ class Client:
 			self.user_paused = True
 			self.isPlayingBuffered = False
 			print("Pause clicked. Display stopped. Background downloading...")
-			# self.sendRtspRequest(self.PAUSE)
+			self.sendRtspRequest(self.PAUSE)
 	
 	def playMovie(self):
 		"""Play button handler."""
@@ -179,10 +182,14 @@ class Client:
 					
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
-		cachename = CACHE_FILE_NAME + str(self.sessionId) + "-" + str(self.frameNbr) + CACHE_FILE_EXT
-		file = open(cachename, "wb")
-		file.write(data)
+		cachename = os.path.join(
+			CACHE_DIR,
+			f"{CACHE_FILE_NAME}{str(self.sessionId)}-{str(self.frameNbr)}{CACHE_FILE_EXT}"
+		)
+		with open(cachename, "wb") as file:
+			file.write(data)
 		file.close()
+		return cachename
 		
 	# 	return cachename
 	
@@ -269,9 +276,11 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.TEARDOWN
-			for f in glob.glob(CACHE_FILE_NAME + "*"):
-				try: os.remove(f)
-				except: pass
+			for f in glob.glob(os.path.join(CACHE_DIR, f"{CACHE_FILE_NAME}*")):
+				try: 
+					os.remove(f)
+				except: 
+					pass
 		else:
 			return
 		
@@ -376,12 +385,16 @@ class Client:
 				if self.isPlayingBuffered:
 					if not self.buffer.empty():
 						frame_name = self.buffer.get()
-						self.updateMovie(frame_name)
-						# Remove cached temp file after displaying the frame
 						try:
-							os.remove(frame_name)
-						except:
-							pass
+							with open(frame_name, "rb") as cached_frame:
+								frame_bytes = cached_frame.read()
+							self.updateMovie(frame_bytes)
+						finally:
+							# Remove cached temp file after displaying the frame
+							try:
+								os.remove(frame_name)
+							except:
+								pass
 					else:
 						# If playback is running but buffer becomes empty → rebuffer
 						# But if the user manually paused, do NOT print warnings
