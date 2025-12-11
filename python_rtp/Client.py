@@ -4,6 +4,7 @@ from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
 import io 
 
+import queue,glob
 from RtpPacket import RtpPacket
 
 CACHE_FILE_NAME = "cache-"
@@ -35,6 +36,10 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+		self.buffer = queue.Queue(maxsize=200)
+		self.BUFFER_THRESHOLD = 40
+		self.isPlayingBuffered = False
+		self.user_paused = False
 		self.recvBuffer = b""  # accumulate RTP payloads for SOI/EOI parsing
 		self.firstFrame = True
 		
@@ -86,15 +91,26 @@ class Client:
 	def pauseMovie(self):
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
-			self.sendRtspRequest(self.PAUSE)
+			self.user_paused = True
+			self.isPlayingBuffered = False
+			print("Pause clicked. Display stopped. Background downloading...")
+			# self.sendRtspRequest(self.PAUSE)
 	
 	def playMovie(self):
 		"""Play button handler."""
+		self.user_paused = False
+		if not self.buffer.empty():
+			self.isPlayingBuffered = True
+
+		if self.state == self.PLAYING:
+			print("Resuming Display ONLY (Server was already running in background).")
+			return
 		if self.state == self.READY:
 			# Create a new thread to listen for RTP packets
-			threading.Thread(target=self.listenRtp).start()
+			print("Resuming Server & Display...")
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
+			threading.Thread(target=self.listenRtp, daemon=True).start()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -134,6 +150,18 @@ class Client:
 						print(f"Completed frame #{self.frameNbr}, size={len(frame)} bytes")
 						self.updateMovie(frame)
 
+					currFrameNbr = rtpPacket.seqNum()
+					print("Current Seq Num: " + str(currFrameNbr))
+										
+					if currFrameNbr > self.frameNbr: # Discard the late packet
+						self.frameNbr = currFrameNbr
+						frame_name = self.writeFrame(rtpPacket.getPayload())
+
+						if not self.buffer.full():
+							self.buffer.put(frame_name)
+						if self.buffer.full() and self.state == self.PLAYING and self.user_paused:
+							print("Buffer is FULL (200 frames). Auto-pausing Server to save bandwidth...")
+							self.sendRtspRequest(self.PAUSE)
 			except:
 				if self.playEvent.isSet():
 					break
@@ -148,6 +176,13 @@ class Client:
 	# 	file = open(cachename, "wb")
 	# 	file.write(data)
 	# 	file.close()
+					
+	def writeFrame(self, data):
+		"""Write the received frame to a temp image file. Return the image file."""
+		cachename = CACHE_FILE_NAME + str(self.sessionId) + "-" + str(self.frameNbr) + CACHE_FILE_EXT
+		file = open(cachename, "wb")
+		file.write(data)
+		file.close()
 		
 	# 	return cachename
 	
@@ -185,6 +220,7 @@ class Client:
 		if requestCode == self.SETUP and self.state == self.INIT:
 			threading.Thread(target=self.recvRtspReply).start()
 			# Update RTSP sequence number.
+			self.run_buffer()
 			self.rtspSeq += 1
 			
 			# Write the RTSP request to be sent.
@@ -233,6 +269,9 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.TEARDOWN
+			for f in glob.glob(CACHE_FILE_NAME + "*"):
+				try: os.remove(f)
+				except: pass
 		else:
 			return
 		
@@ -316,3 +355,39 @@ class Client:
 			self.exitClient()
 		else: # When the user presses cancel, resume playing.
 			self.playMovie()
+
+	def run_buffer(self):
+			"""(Consumer) - YouTube Style"""
+			if self.state != self.TEARDOWN:
+				
+				# --- AUTO-START WHEN BUFFER IS READY ---
+				# Auto-start playback only when BOTH conditions are true:
+				# 1. Playback is not currently running (isPlayingBuffered = False)
+				# 2. User did NOT press Pause (user_paused = False)
+				if not self.isPlayingBuffered and not self.user_paused:
+					if self.buffer.qsize() >= self.BUFFER_THRESHOLD:
+						self.isPlayingBuffered = True
+						print("Buffering Complete! Starting playback...")
+					else:
+						print(f"Buffering... {self.buffer.qsize()}/{self.BUFFER_THRESHOLD}")
+						pass
+
+				# --- DISPLAY FRAMES FROM BUFFER ---
+				if self.isPlayingBuffered:
+					if not self.buffer.empty():
+						frame_name = self.buffer.get()
+						self.updateMovie(frame_name)
+						# Remove cached temp file after displaying the frame
+						try:
+							os.remove(frame_name)
+						except:
+							pass
+					else:
+						# If playback is running but buffer becomes empty → rebuffer
+						# But if the user manually paused, do NOT print warnings
+						if not self.user_paused:
+							print("Buffer empty! Re-buffering...")
+							self.isPlayingBuffered = False
+
+				# Schedule the next buffer step in 50ms
+				self.master.after(50, self.run_buffer)
