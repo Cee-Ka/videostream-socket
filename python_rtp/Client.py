@@ -50,6 +50,11 @@ class Client:
         # Để detect packet/frame loss (seqNum = frame number, không phải packet number)
         self.currentFrameSeq = -1  # frame đang nhận
         self.lastCompletedFrameSeq = -1  # frame hoàn chỉnh gần nhất
+        
+        # Bandwidth protection - đơn giản và hiệu quả
+        self.droppedFrames = 0  # đếm frame bị drop
+        self.BUFFER_WARNING = 400  # ngưỡng cảnh báo (67% của 600)
+        self.BUFFER_CRITICAL = 550  # ngưỡng nguy hiểm (92% của 600)
 
     def resetVideo(self):
         """Reset trạng thái để reload."""
@@ -59,6 +64,7 @@ class Client:
 
         self.currentFrameSeq = -1
         self.lastCompletedFrameSeq = -1
+        self.droppedFrames = 0
         
         with self.frameBuffer.mutex:
             self.frameBuffer.queue.clear()
@@ -207,7 +213,8 @@ class Client:
                     break
 
     def consumeBuffer(self):
-        FRAME_DELAY = 0.05 
+        FRAME_DELAY_NORMAL = 0.05   # 20 fps bình thường
+        FRAME_DELAY_FAST = 0.025    # 40 fps khi cần catch up
         PRE_BUFFER = 20    
 
         while True:
@@ -221,6 +228,24 @@ class Client:
                     threading.Event().wait(0.1)
                     continue
 
+            bufferSize = self.frameBuffer.qsize()
+            
+            # === BANDWIDTH PROTECTION ===
+            # Mức CRITICAL: drop nhiều frame để tránh overflow
+            if bufferSize >= self.BUFFER_CRITICAL:
+                framesToDrop = bufferSize - self.BUFFER_WARNING
+                for _ in range(framesToDrop):
+                    if not self.frameBuffer.empty():
+                        self.frameBuffer.get()  # discard
+                        self.droppedFrames += 1
+                print(f"[BANDWIDTH] Critical! Dropped {framesToDrop} frames. Buffer: {self.frameBuffer.qsize()}")
+            
+            # Mức WARNING: drop 1 frame mỗi 2 frame để giảm dần
+            elif bufferSize >= self.BUFFER_WARNING:
+                if not self.frameBuffer.empty():
+                    self.frameBuffer.get()  # drop 1 frame
+                    self.droppedFrames += 1
+
             if not self.frameBuffer.empty():
                 frameData = self.frameBuffer.get()
                 try:
@@ -228,7 +253,12 @@ class Client:
                     self.updateMovie(path)
                 except Exception as e:
                     print(f"Skipping bad frame: {e}")
-                threading.Event().wait(FRAME_DELAY)
+                
+                # Adaptive delay: nhanh hơn khi buffer lớn
+                if bufferSize > self.BUFFER_WARNING // 2:
+                    threading.Event().wait(FRAME_DELAY_FAST)
+                else:
+                    threading.Event().wait(FRAME_DELAY_NORMAL)
             else:
                 threading.Event().wait(0.01)
 
