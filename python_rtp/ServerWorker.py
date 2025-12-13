@@ -64,11 +64,22 @@ class ServerWorker:
 				# Generate a randomized RTSP session ID
 				self.clientInfo['session'] = randint(100000, 999999)
 				
-				# Send RTSP reply
-				self.replyRtsp(self.OK_200, seq[1])
-				
 				# Get the RTP/UDP port from the last line
 				self.clientInfo['rtpPort'] = request[2].split(' ')[3]
+				# --- ĐOẠN CODE MỚI: BẮT ĐẦU GỬI NGAY TẠI ĐÂY ---
+                # 1. Tạo Socket RTP
+				self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+				
+                # 2. Tạo Event để quản lý dừng/chạy
+				self.clientInfo['event'] = threading.Event()
+                
+                # 3. Bắt đầu luồng gửi dữ liệu luôn
+				self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
+				self.clientInfo['worker'].start()
+				
+				# Send RTSP reply
+				self.replyRtsp(self.OK_200, seq[1])
+
 				
 		# Process PLAY request 		
 		elif requestType == self.PLAY:
@@ -76,15 +87,23 @@ class ServerWorker:
 				print("processing PLAY\n")
 				self.state = self.PLAYING
 				
+				# --- LOGIC MỚI: KIỂM TRA VÀ KHỞI ĐỘNG LẠI LUỒNG GỬI ---
+				# Kiểm tra xem luồng gửi có đang sống không?
+				# Nếu chưa có 'worker' (lỗi logic) HOẶC luồng đã chết (do PAUSE trước đó) -> Tạo mới
+				if 'worker' not in self.clientInfo or not self.clientInfo['worker'].is_alive():
+					self.clientInfo['event'] = threading.Event()
+					self.clientInfo['worker'] = threading.Thread(target=self.sendRtp) 
+					self.clientInfo['worker'].start()
+				
 				# Create a new socket for RTP/UDP
-				self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+				# self.clientInfo["rtpSocket"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 				
 				self.replyRtsp(self.OK_200, seq[1])
 				
-				# Create a new thread and start sending RTP packets
-				self.clientInfo['event'] = threading.Event()
-				self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
-				self.clientInfo['worker'].start()
+				# # Create a new thread and start sending RTP packets
+				# self.clientInfo['event'] = threading.Event()
+				# self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
+				# self.clientInfo['worker'].start()
 		
 		# Process PAUSE request
 		elif requestType == self.PAUSE:
@@ -109,33 +128,54 @@ class ServerWorker:
 			
 	def sendRtp(self):
 		"""Send RTP packets over UDP."""
+		MAX_PAYLOAD_SIZE = 1400 # Kích thước an toàn cho UDP (MTU)
+		preBufferCount = 0      # Đếm số frame đã gửi trong lúc chờ
+		PRE_BUFFER_LIMIT = 20
 		while True:
 			self.clientInfo['event'].wait(0.05) 
-			
 			# Stop sending if request is PAUSE or TEARDOWN
 			if self.clientInfo['event'].isSet(): 
 				break 
-				
+			if self.state == self.READY:
+				# Nếu đã gửi đủ 20 frame "mồi" thì nghỉ, không gửi nữa
+				if preBufferCount >= PRE_BUFFER_LIMIT:
+					continue # Quay lại đầu vòng lặp, đợi lệnh PLAY
+				else:
+					preBufferCount += 1
 			data = self.clientInfo['videoStream'].nextFrame()
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
 				try:
 					address = self.clientInfo['rtspSocket'][1][0]
 					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
+
+					data_len = len(data)
+					curr_pos = 0
+
+					while curr_pos < data_len:
+						# Lấy 1 đoạn data (chunk)
+						chunk = data[curr_pos : curr_pos + MAX_PAYLOAD_SIZE]
+						curr_pos += MAX_PAYLOAD_SIZE
+						
+						# Nếu đã gửi hết data của frame này, marker = 1. Ngược lại = 0
+						if curr_pos >= data_len:
+							marker = 1
+						else:
+							marker = 0
+						self.clientInfo['rtpSocket'].sendto(self.makeRtp(chunk, frameNumber, marker),(address,port))
 				except:
 					print("Connection Error")
 					#print('-'*60)
 					#traceback.print_exc(file=sys.stdout)
 					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
+	def makeRtp(self, payload, frameNbr, marker = 0):
 		"""RTP-packetize the video data."""
 		version = 2
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		# marker = 0
 		pt = 26 # MJPEG type
 		seqnum = frameNbr
 		ssrc = 0 

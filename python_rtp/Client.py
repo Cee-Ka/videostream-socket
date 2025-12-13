@@ -2,9 +2,9 @@ from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
-
+import queue
 from RtpPacket import RtpPacket
-
+import time
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
 
@@ -34,9 +34,43 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+
+		self.maxedFrameRecieved = 0
+		self.totalBytesReceived = 0 # Tổng số byte đã nhận
+		self.startTime = 0          # Thời gian bắt đầu nhận gói đầu tiên
+		self.endTime = 0            # Thời gian kết thúc
+		self.totalFramesReceived = 0 # Tổng số frame hoàn chỉnh đã nhận
+
+		self.frameBuffer = queue.Queue(maxsize=100)
+		self.incompleteFrame = b''
+		self.bufferStarted = False
+
+	def resetVideo(self):
+		"""Hàm dọn dẹp bộ nhớ để chuẩn bị cho lần Reload tiếp theo"""
+		self.frameNbr = 0
+		self.incompleteFrame = b''
+		self.bufferStarted = False
 		
+		# Xóa sạch hàng đợi (Queue)
+		with self.frameBuffer.mutex:
+			self.frameBuffer.queue.clear()
+			
+		# Reset các biến thống kê (Analysis)
+		self.totalBytesReceived = 0
+		self.startTime = 0
+		self.endTime = 0
+		self.totalFramesReceived = 0
+
+		# Xóa file cache trên ổ cứng
+		try:
+			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT)
+		except OSError:
+			pass	
+
 	def createWidgets(self):
 		"""Build GUI."""
+		self.master.grid_rowconfigure(0, weight=1)
+		self.master.grid_columnconfigure(0, weight=1)
 		# Create Setup button
 		self.setup = Button(self.master, width=20, padx=3, pady=3)
 		self.setup["text"] = "Setup"
@@ -62,7 +96,7 @@ class Client:
 		self.teardown.grid(row=1, column=3, padx=2, pady=2)
 		
 		# Create a label to display the movie
-		self.label = Label(self.master, height=19)
+		self.label = Label(self.master)
 		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
 	
 	def setupMovie(self):
@@ -72,9 +106,51 @@ class Client:
 	
 	def exitClient(self):
 		"""Teardown button handler."""
-		self.sendRtspRequest(self.TEARDOWN)		
-		self.master.destroy() # Close the gui window
-		os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		self.playEvent.set()
+		self.sendRtspRequest(self.TEARDOWN)
+		
+		# --- ANALYSIS REPORT (BÁO CÁO PHÂN TÍCH) ---
+		print("\n" + "="*40)
+		print("       VIDEO STREAMING SESSION REPORT       ")
+		print("="*40)
+		
+		# 1. Tính thời gian session
+		duration = self.endTime - self.startTime
+		if duration <= 0: duration = 1 # Tránh chia cho 0
+		
+		# 2. Tính Frame Loss (Tỉ lệ mất frame)
+		# Server gửi frame sequence: 1, 2, 3... N
+		# Nếu self.frameNbr (số lớn nhất nhận được) là 100, mà totalFramesReceived chỉ là 95
+		# -> Mất 5 frame.
+		expectedFrames = self.frameNbr - self.maxedFrameRecieved
+		if expectedFrames > 0:
+			lostFrames = expectedFrames - self.totalFramesReceived
+			lossRate = (lostFrames / expectedFrames) * 100
+		else:
+			lostFrames = 0
+			lossRate = 0.0
+			
+		# 3. Tính Network Usage (Băng thông)
+		# Chuyển đổi Bytes -> kBits (Kilobits)
+		totalKbits = (self.totalBytesReceived * 8) / 1000
+		bitrate = totalKbits / duration # kbps
+		
+		print(f"Total Duration      : {duration:.2f} seconds")
+		print(f"Total Bytes Received: {self.totalBytesReceived / 1024:.2f} KB")
+		print(f"Average Bitrate     : {bitrate:.2f} kbps")
+		print("-" * 40)
+		print(f"Max Sequence Number : {expectedFrames}")
+		print(f"Total Frames Decoded: {self.totalFramesReceived}")
+		print(f"Frames Lost         : {lostFrames}")
+		print(f"Packet Loss Rate    : {lossRate:.2f} %")
+		print("="*40 + "\n")
+		# -------------------------------------------
+
+		self.master.destroy() 
+		try:
+			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) 
+		except:
+			pass
 
 	def pauseMovie(self):
 		"""Pause button handler."""
@@ -85,9 +161,15 @@ class Client:
 		"""Play button handler."""
 		if self.state == self.READY:
 			# Create a new thread to listen for RTP packets
-			threading.Thread(target=self.listenRtp).start()
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
+
+			# Thread 1: Nhận dữ liệu mạng và đẩy vào Buffer
+			threading.Thread(target=self.listenRtp).start()
+			# self.maxedFrameRecieved=self.frameNbr
+			# print(self.maxedFrameRecieved)
+			# Thread 2: Lấy từ Buffer ra hiển thị (Advanced)
+			threading.Thread(target=self.consumeBuffer).start()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -96,15 +178,38 @@ class Client:
 			try:
 				data = self.rtpSocket.recv(20480)
 				if data:
+					# --- ANALYSIS: Cập nhật dữ liệu ---
+					curTime = time.time()
+					if self.startTime == 0:
+						self.startTime = curTime # Ghi lại mốc thời gian bắt đầu
+					self.endTime = curTime       # Cập nhật thời gian mới nhất
+					
+					self.totalBytesReceived += len(data) # Cộng dồn dung lượng
+					# ----------------------------------
+
 					rtpPacket = RtpPacket()
 					rtpPacket.decode(data)
 					
-					currFrameNbr = rtpPacket.seqNum()
-					print("Current Seq Num: " + str(currFrameNbr))
+					self.incompleteFrame += rtpPacket.getPayload()
+
+					if rtpPacket.getMarker() == 1:
+						# --- ANALYSIS: Đếm số frame nhận được ---
+						self.totalFramesReceived += 1
+						# ----------------------------------------
+						
+						currFrameNbr = rtpPacket.seqNum()
+						# ... (Logic buffer cũ giữ nguyên)
+						if currFrameNbr > self.frameNbr:
+							self.frameNbr = currFrameNbr
+							try:
+								self.frameBuffer.put(self.incompleteFrame, timeout=1.0)
+							except queue.Full:
+								pass 
+						self.incompleteFrame = b''
 										
-					if currFrameNbr > self.frameNbr: # Discard the late packet
-						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+					# if currFrameNbr > self.frameNbr: # Discard the late packet
+					# 	self.frameNbr = currFrameNbr
+						# self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
 			except:
 				# Stop listening upon requesting PAUSE or TEARDOWN
 				if self.playEvent.isSet(): 
@@ -116,7 +221,46 @@ class Client:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
 					break
-					
+
+	def consumeBuffer(self):
+		"""Hàm mới: Lấy frame từ buffer và hiển thị (Client-side Caching)"""
+		FRAME_DELAY = 0.05 # Tốc độ phát (50ms)
+		PRE_BUFFER = 20    # Cần nạp trước 10 frame rồi mới chạy (Pre-buffering)
+
+		while True:
+			if self.playEvent.isSet():
+				break
+
+			# Logic Pre-buffering: Đợi buffer nạp đủ N frame rồi mới bắt đầu
+			if not self.bufferStarted:
+				if self.frameBuffer.qsize() >= PRE_BUFFER:
+					self.bufferStarted = True
+					print("Buffering complete. Starting playback...")
+				else:
+					# Đợi một chút để buffer đầy
+					threading.Event().wait(0.1)
+					continue
+
+			# Logic Playback
+			if not self.frameBuffer.empty():
+				frameData = self.frameBuffer.get()
+				
+				# --- SỬA LỖI TẠI ĐÂY ---
+				try:
+					# Thử ghi file và hiển thị
+					path = self.writeFrame(frameData)
+					self.updateMovie(path)
+				except Exception as e:
+					# Nếu ảnh lỗi (do mất gói tin UDP), in ra lỗi và BỎ QUA frame này
+					# Không để chương trình bị crash
+					print(f"Skipping bad frame: {e}")
+				# -----------------------
+
+				# Giả lập tốc độ khung hình (sleep)
+				threading.Event().wait(FRAME_DELAY)
+			else:
+				# Nếu buffer rỗng, đợi thêm dữ liệu
+				threading.Event().wait(0.01)
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
 		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
@@ -129,7 +273,7 @@ class Client:
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
 		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
+		self.label.configure(image = photo, anchor="center") 
 		self.label.image = photo
 		
 	def connectToServer(self):
@@ -281,3 +425,4 @@ class Client:
 			self.exitClient()
 		else: # When the user presses cancel, resume playing.
 			self.playMovie()
+

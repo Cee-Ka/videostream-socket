@@ -16,7 +16,7 @@ class RtpPacket:
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		# marker = 0
 		pt = 26 # Payload type for MJPEG
 		#--------------
 		# Fill the header bytearray with RTP header fields
@@ -71,3 +71,6 @@ class RtpPacket:
 	def getPacket(self):
 		"""Return RTP packet."""
 		return self.header + self.payload
+	
+	def getMarker(self):
+		return (self.header[1] >> 7) & 1
