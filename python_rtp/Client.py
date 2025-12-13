@@ -41,6 +41,10 @@ class Client:
 		
 	def createWidgets(self):
 		"""Build GUI."""
+		self.master.grid_rowconfigure(0, weight=1)
+		for i in range(4):
+			self.master.grid_columnconfigure(i, weight=1)
+
 		# Create Setup button
 		self.setup = Button(self.master, width=20, padx=3, pady=3)
 		self.setup["text"] = "Setup"
@@ -67,7 +71,7 @@ class Client:
 		
 		# Create a label to display the movie
 		self.label = Label(self.master, height=19)
-		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
+		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=10, pady=10) 
 	
 	def setupMovie(self):
 		"""Setup button handler."""
@@ -150,9 +154,23 @@ class Client:
 	
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
+		image = Image.open(imageFile)
+		orig_width, orig_height = image.width, image.height
+
+		# Ensure there is room for control buttons by constraining displayed size.
+		self.master.update_idletasks()
+		controls_height = max(self.setup.winfo_height(), self.setup.winfo_reqheight(), 40) + 20
+		max_width = max(200, self.master.winfo_screenwidth() - 40)
+		max_height = max(200, self.master.winfo_screenheight() - controls_height - 40)
+		if image.width > max_width or image.height > max_height:
+			image = image.copy()
+
+		width, height = image.width, image.height
+		photo = ImageTk.PhotoImage(image)
+		self.label.configure(image=photo, width=width, height=height)
 		self.label.image = photo
+		# Display source and displayed resolution in the window title.
+		self.master.title(f"RTPClient - {orig_width}x{orig_height} (display {width}x{height})")
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
