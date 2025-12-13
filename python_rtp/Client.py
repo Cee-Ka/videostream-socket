@@ -1,9 +1,10 @@
 from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os
+import socket, threading, sys, traceback, os, time
 
 from RtpPacket import RtpPacket
+from NetworkStats import NetworkStats
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -34,6 +35,9 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+		self.fragmentBuffer = {}
+		self.fragmentMetadata = {}
+		self.stats = NetworkStats()
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -74,7 +78,10 @@ class Client:
 		"""Teardown button handler."""
 		self.sendRtspRequest(self.TEARDOWN)		
 		self.master.destroy() # Close the gui window
-		os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		try:
+			os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		except OSError:
+			pass
 
 	def pauseMovie(self):
 		"""Pause button handler."""
@@ -94,18 +101,33 @@ class Client:
 		"""Listen for RTP packets."""
 		while True:
 			try:
-				data = self.rtpSocket.recv(20480)
+				data = self.rtpSocket.recv(65535)
 				if data:
 					rtpPacket = RtpPacket()
 					rtpPacket.decode(data)
+					self.stats.recordPacketReceived(len(rtpPacket.getPacket()))
 					
+					if rtpPacket.isFragmented():
+						self.handleFragmentedPacket(rtpPacket)
+						continue
+
 					currFrameNbr = rtpPacket.seqNum()
 					print("Current Seq Num: " + str(currFrameNbr))
 										
 					if currFrameNbr > self.frameNbr: # Discard the late packet
 						self.frameNbr = currFrameNbr
 						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
-			except:
+						self.stats.recordFrameReceived()
+			except socket.timeout:
+				# Stop listening upon requesting PAUSE or TEARDOWN
+				if self.playEvent.isSet(): 
+					break
+				if self.teardownAcked == 1:
+					self.rtpSocket.shutdown(socket.SHUT_RDWR)
+					self.rtpSocket.close()
+					break
+				continue
+			except Exception:
 				# Stop listening upon requesting PAUSE or TEARDOWN
 				if self.playEvent.isSet(): 
 					break
@@ -142,10 +164,6 @@ class Client:
 	
 	def sendRtspRequest(self, requestCode):
 		"""Send RTSP request to the server."""	
-		#-------------
-		# TO COMPLETE
-		#-------------
-		
 		# Setup request
 		if requestCode == self.SETUP and self.state == self.INIT:
 			threading.Thread(target=self.recvRtspReply).start()
@@ -193,7 +211,7 @@ class Client:
 			
 			# Write the RTSP request to be sent.
 			request = f"TEARDOWN {self.fileName} RTSP/1.0\n" \
-					  f"Cseq: {self.rtspSeq}\n" \
+					  f"CSeq: {self.rtspSeq}\n" \
 					  f"Session: {self.sessionId}"
 			
 			# Keep track of the sent request.
@@ -281,3 +299,60 @@ class Client:
 			self.exitClient()
 		else: # When the user presses cancel, resume playing.
 			self.playMovie()
+
+	def handleFragmentedPacket(self, rtpPacket):
+		"""Receive and reassemble fragmented packets."""
+		fragmentId = rtpPacket.getFragmentId()
+		totalFragments = rtpPacket.getTotalFragments()
+		fragmentIndex = rtpPacket.getFragmentIndex()
+		payload = rtpPacket.getPayload()
+
+		# Initialize buffer for new frame
+		if fragmentId not in self.fragmentBuffer:
+			self.fragmentBuffer[fragmentId] = {}
+			self.fragmentMetadata[fragmentId] = (totalFragments, time.time())
+			print(f"[Client] New fragmented frame: ID={fragmentId}, total={totalFragments} fragments")
+
+		# Store fragment
+		self.fragmentBuffer[fragmentId][fragmentIndex] = payload
+		self.stats.recordFragmentReceived()
+
+		# Check if complete
+		if len(self.fragmentBuffer[fragmentId]) == totalFragments:
+			# Reassemble in order
+			frameData = b''.join(
+				self.fragmentBuffer[fragmentId][i]
+				for i in range(totalFragments)
+			)
+			frameSize = len(frameData)
+			print(f"[Client] Frame {self.frameNbr} reassembled from {totalFragments} fragments ({frameSize} bytes)")
+
+			# Display frame
+			self.updateMovie(self.writeFrame(frameData))
+			self.frameNbr = max(self.frameNbr, rtpPacket.seqNum())
+			self.stats.recordFrameReceived()
+
+			# Cleanup
+			del self.fragmentBuffer[fragmentId]
+			del self.fragmentMetadata[fragmentId]
+
+		# Timeout check (cleanup incomplete frames)
+		self.cleanupFragmentBuffer()
+
+	def cleanupFragmentBuffer(self, timeout=5.0):
+		"""Remove incomplete frames after timeout."""
+		currentTime = time.time()
+		toDelete = []
+
+		for fragmentId, (total, timestamp) in self.fragmentMetadata.items():
+			if currentTime - timestamp > timeout:
+				received = len(self.fragmentBuffer.get(fragmentId, {}))
+				print(f"[Client] Dropping incomplete frame: ID={fragmentId}, received {received}/{total} fragments")
+				toDelete.append(fragmentId)
+				self.stats.recordFrameLost()
+
+		for fragmentId in toDelete:
+			if fragmentId in self.fragmentBuffer:
+				del self.fragmentBuffer[fragmentId]
+			if fragmentId in self.fragmentMetadata:
+				del self.fragmentMetadata[fragmentId]
