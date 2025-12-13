@@ -35,7 +35,6 @@ class Client:
 		self.connectToServer()
 		self.frameNbr = 0
 
-		self.maxedFrameRecieved = 0
 		self.totalBytesReceived = 0 # Tổng số byte đã nhận
 		self.startTime = 0          # Thời gian bắt đầu nhận gói đầu tiên
 		self.endTime = 0            # Thời gian kết thúc
@@ -122,7 +121,7 @@ class Client:
 		# Server gửi frame sequence: 1, 2, 3... N
 		# Nếu self.frameNbr (số lớn nhất nhận được) là 100, mà totalFramesReceived chỉ là 95
 		# -> Mất 5 frame.
-		expectedFrames = self.frameNbr - self.maxedFrameRecieved
+		expectedFrames = self.frameNbr
 		if expectedFrames > 0:
 			lostFrames = expectedFrames - self.totalFramesReceived
 			lossRate = (lostFrames / expectedFrames) * 100
@@ -166,7 +165,7 @@ class Client:
 
 			# Thread 1: Nhận dữ liệu mạng và đẩy vào Buffer
 			threading.Thread(target=self.listenRtp).start()
-			# self.maxedFrameRecieved=self.frameNbr
+			self.maxedFrameRecieved=self.frameNbr
 			# print(self.maxedFrameRecieved)
 			# Thread 2: Lấy từ Buffer ra hiển thị (Advanced)
 			threading.Thread(target=self.consumeBuffer).start()

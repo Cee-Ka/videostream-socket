@@ -73,9 +73,9 @@ class ServerWorker:
                 # 2. Tạo Event để quản lý dừng/chạy
 				self.clientInfo['event'] = threading.Event()
                 
-                # 3. Bắt đầu luồng gửi dữ liệu luôn
-				self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
-				self.clientInfo['worker'].start()
+                # # 3. Bắt đầu luồng gửi dữ liệu luôn
+				# self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
+				# self.clientInfo['worker'].start()
 				
 				# Send RTSP reply
 				self.replyRtsp(self.OK_200, seq[1])
@@ -136,12 +136,7 @@ class ServerWorker:
 			# Stop sending if request is PAUSE or TEARDOWN
 			if self.clientInfo['event'].isSet(): 
 				break 
-			if self.state == self.READY:
-				# Nếu đã gửi đủ 20 frame "mồi" thì nghỉ, không gửi nữa
-				if preBufferCount >= PRE_BUFFER_LIMIT:
-					continue # Quay lại đầu vòng lặp, đợi lệnh PLAY
-				else:
-					preBufferCount += 1
+				
 			data = self.clientInfo['videoStream'].nextFrame()
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
