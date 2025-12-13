@@ -80,7 +80,7 @@ class Client:
         self.teardown.grid(row=1, column=3, padx=2, pady=2)
         
         # Label nền đen, tự co giãn
-        self.label = Label(self.master, bg="black")
+        self.label = Label(self.master)
         self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
     
     def setupMovie(self):
@@ -88,7 +88,10 @@ class Client:
             self.sendRtspRequest(self.SETUP)
     
     def exitClient(self):
-        self.playEvent.set()
+        try:
+            self.playEvent.set()
+        except:
+            pass
         self.sendRtspRequest(self.TEARDOWN)
         
         # --- REPORT ---
@@ -205,19 +208,11 @@ class Client:
         return cachename
     
     def updateMovie(self, imageFile):
-        """Resize và hiển thị ảnh."""
-        try:
-            w = self.label.winfo_width()
-            h = self.label.winfo_height()
-            if w < 10: w, h = 640, 480 
+        """Update the image file as video frame in the GUI."""
+        photo = ImageTk.PhotoImage(Image.open(imageFile))
+        self.label.configure(image = photo) 
+        self.label.image = photo
 
-            # Resize ảnh cho vừa khung
-            photo = ImageTk.PhotoImage(Image.open(imageFile).resize((w, h)))
-            self.label.configure(image = photo, width=w, height=h) 
-            self.label.image = photo
-        except:
-            pass
-        
     def connectToServer(self):
         self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
