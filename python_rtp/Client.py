@@ -1,7 +1,7 @@
 from tkinter import * # type: ignore
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
-import socket, threading, sys, os
+import socket, threading, sys, traceback, os
 import queue
 from RtpPacket import RtpPacket
 import time
@@ -14,12 +14,13 @@ class Client:
     READY = 1
     PLAYING = 2
     state = INIT
-    
+
     SETUP = 0
     PLAY = 1
     PAUSE = 2
     TEARDOWN = 3
-    
+
+    # Initiation..
     def __init__(self, master, serveraddr, serverport, rtpport, filename):
         self.master = master
         self.master.protocol("WM_DELETE_WINDOW", self.handler)
@@ -45,12 +46,20 @@ class Client:
         self.frameBuffer = queue.Queue(maxsize=600)
         self.incompleteFrame = b''
         self.bufferStarted = False
+        
+        # Để detect packet/frame loss (seqNum = frame number, không phải packet number)
+        self.currentFrameSeq = -1  # frame đang nhận
+        self.lastCompletedFrameSeq = -1  # frame hoàn chỉnh gần nhất
 
     def resetVideo(self):
         """Reset trạng thái để reload."""
         self.frameNbr = 0
         self.incompleteFrame = b''
         self.bufferStarted = False
+
+        self.currentFrameSeq = -1
+        self.lastCompletedFrameSeq = -1
+        
         with self.frameBuffer.mutex:
             self.frameBuffer.queue.clear()
         self.totalBytesReceived = 0
@@ -82,11 +91,11 @@ class Client:
         # Label nền đen, tự co giãn
         self.label = Label(self.master)
         self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
-    
+
     def setupMovie(self):
         if self.state == self.INIT:
             self.sendRtspRequest(self.SETUP)
-    
+
     def exitClient(self):
         try:
             self.playEvent.set()
@@ -131,7 +140,7 @@ class Client:
     def pauseMovie(self):
         if self.state == self.PLAYING:
             self.sendRtspRequest(self.PAUSE)
-    
+
     def playMovie(self):
         if self.state == self.READY:
             self.playEvent = threading.Event()
@@ -142,7 +151,7 @@ class Client:
             threading.Thread(target=self.consumeBuffer).start()
             
             self.sendRtspRequest(self.PLAY)
-    
+
     def listenRtp(self):        
         while True:
             try:
@@ -155,19 +164,41 @@ class Client:
 
                     rtpPacket = RtpPacket()
                     rtpPacket.decode(data)
+                    
+                    currSeqNum = rtpPacket.seqNum()  # = frame number (tất cả packet cùng frame có cùng seqNum)
+                    
+                    # Nếu đây là packet của frame mới (seqNum khác với frame đang nhận)
+                    if currSeqNum != self.currentFrameSeq:
+                        # Nếu đang có frame dở dang mà chưa nhận được marker -> packet loss
+                        if self.currentFrameSeq != -1 and self.incompleteFrame:
+                            print(f"[PACKET LOSS] Frame {self.currentFrameSeq} incomplete, discarding. New frame {currSeqNum} started.")
+                            self.incompleteFrame = b''
+                        self.currentFrameSeq = currSeqNum
+                    
+                    # Accumulate payload cho frame hiện tại
                     self.incompleteFrame += rtpPacket.getPayload()
 
                     if rtpPacket.getMarker() == 1:
-                        self.totalFramesReceived += 1
-                        currFrameNbr = rtpPacket.seqNum()
+                        # Đây là packet cuối của frame
+                        # Kiểm tra xem có bị mất frame nào không (gap trong sequence)
+                        if self.lastCompletedFrameSeq != -1 and currSeqNum > self.lastCompletedFrameSeq + 1:
+                            lostFrames = currSeqNum - self.lastCompletedFrameSeq - 1
+                            print(f"[FRAME LOSS] Skipped {lostFrames} frame(s) between seq {self.lastCompletedFrameSeq} and {currSeqNum}")
                         
-                        if currFrameNbr > self.frameNbr:
-                            self.frameNbr = currFrameNbr
+                        # Frame hoàn chỉnh, đưa vào buffer
+                        self.totalFramesReceived += 1
+                        
+                        if currSeqNum > self.frameNbr:
+                            self.frameNbr = currSeqNum
                             try:
                                 self.frameBuffer.put(self.incompleteFrame, timeout=1.0)
                             except queue.Full:
-                                pass 
+                                pass
+                        
+                        # Cập nhật tracking
+                        self.lastCompletedFrameSeq = currSeqNum
                         self.incompleteFrame = b''
+                        self.currentFrameSeq = -1
             except:
                 if self.playEvent.isSet(): break
                 if self.teardownAcked == 1:
@@ -206,7 +237,7 @@ class Client:
         with open(cachename, "wb") as file:
             file.write(data)
         return cachename
-    
+
     def updateMovie(self, imageFile):
         """Update the image file as video frame in the GUI."""
         photo = ImageTk.PhotoImage(Image.open(imageFile))
@@ -219,7 +250,7 @@ class Client:
             self.rtspSocket.connect((self.serverAddr, self.serverPort))
         except:
             tkMessageBox.showwarning('Connection Failed', 'Connection to \'%s\' failed.' %self.serverAddr)
-    
+
     def sendRtspRequest(self, requestCode):
         if requestCode == self.SETUP and self.state == self.INIT:
             threading.Thread(target=self.recvRtspReply).start()
@@ -246,7 +277,7 @@ class Client:
         
         self.rtspSocket.send(request.encode("utf-8"))
         print('\nData sent:\n' + request)
-    
+
     def recvRtspReply(self):
         while True:
             try:
@@ -259,7 +290,7 @@ class Client:
                     break
             except:
                 break
-    
+
     def parseRtspReply(self, data):
         lines = data.split('\n')
         seqNum = int(lines[1].split(' ')[1])
@@ -280,7 +311,7 @@ class Client:
                         self.state = self.INIT
                         self.teardownAcked = 1 
                         self.resetVideo() # Reload support
-    
+
     def openRtpPort(self):
         self.rtpSocket = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         self.rtpSocket.settimeout(0.5)
