@@ -4,11 +4,12 @@ HEADER_SIZE = 12
 
 class RtpPacket:	
 	header = bytearray(HEADER_SIZE)
-	
+	fragmentHeader = bytearray(4)
 	def __init__(self):
-		pass
-		
-	def encode(self, version, padding, extension, cc, seqnum, marker, pt, ssrc, payload):
+		self.header = bytearray(HEADER_SIZE)
+		self.payload = b''
+		self.fragmentHeader = None
+	def encode(self, version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, fragmentID=0, totalFragments=1, fragNum=0):
 		"""Encode the RTP packet with header fields and payload."""
 		timestamp = int(time())
 		header = bytearray(HEADER_SIZE)
@@ -18,6 +19,11 @@ class RtpPacket:
 		cc = 0
 		marker = 0
 		pt = 26 # Payload type for MJPEG
+
+		if totalFragments > 1:
+			extension = 1
+		else:
+			extension = 0
 		#--------------
 		# Fill the header bytearray with RTP header fields
 		
@@ -36,14 +42,32 @@ class RtpPacket:
 		header[10] = (ssrc >> 8) & 0xFF
 		header[11] = (ssrc & 0xFF)
 		self.header = header
-		
+
+		if totalFragments > 1:
+			self.fragmentHeader = bytearray(4)
+			# 0-1: ID
+			self.fragmentHeader[0] = (fragmentID >> 8) & 0xFF
+			self.fragmentHeader[1] = fragmentID & 0xFF
+			# 2: Total fragments
+			self.fragmentHeader[2] = totalFragments & 0xFF
+			# 3: Fragment number
+			self.fragmentHeader[3] = fragNum & 0xFF
+		else:
+			self.fragmentHeader = None
 		# Get the payload from the argument
 		self.payload = payload
 		
 	def decode(self, byteStream):
 		"""Decode the RTP packet."""
 		self.header = bytearray(byteStream[:HEADER_SIZE])
-		self.payload = byteStream[HEADER_SIZE:]
+
+		extensionBit = (self.header[0] >> 4) & 1
+		if extensionBit == 1:
+			self.fragmentHeader =  bytearray(byteStream[HEADER_SIZE:HEADER_SIZE+4])
+			self.payload = byteStream[HEADER_SIZE+4:]
+		else:
+			self.fragmentHeader = None
+			self.payload = byteStream[HEADER_SIZE:]
 	
 	def version(self):
 		"""Return RTP version."""
@@ -70,4 +94,23 @@ class RtpPacket:
 		
 	def getPacket(self):
 		"""Return RTP packet."""
+		if self.fragmentHeader:
+			return self.header + self.fragmentHeader + self.payload
 		return self.header + self.payload
+	
+	def isFragmented(self):
+		return (self.fragmentHeader is not None)
+	
+	def getFragmentID(self):
+		if self.fragmentHeader:
+			return int.from_bytes(self.fragmentHeader[0:2], byteorder='big')
+		return 0
+	def getTotalFragments(self):
+		if self.fragmentHeader:
+			return self.fragmentHeader[2]
+		return 1
+	def getFragNum(self):
+		if self.fragmentHeader:
+			return self.fragmentHeader[3]
+		return 0
+	

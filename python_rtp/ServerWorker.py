@@ -4,6 +4,7 @@ import sys, traceback, threading, socket
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
 
+import time
 class ServerWorker:
 	SETUP = 'SETUP'
 	PLAY = 'PLAY'
@@ -19,10 +20,11 @@ class ServerWorker:
 	FILE_NOT_FOUND_404 = 1
 	CON_ERR_500 = 2
 	
+	MAX_PAYLOAD_SIZE = 1356
 	clientInfo = {}
-	
 	def __init__(self, clientInfo):
 		self.clientInfo = clientInfo
+		self.fragmentID = 0
 		
 	def run(self):
 		threading.Thread(target=self.recvRtspRequest).start()
@@ -110,7 +112,7 @@ class ServerWorker:
 	def sendRtp(self):
 		"""Send RTP packets over UDP."""
 		while True:
-			self.clientInfo['event'].wait(0.05) 
+			self.clientInfo['event'].wait(0.05) # 30fps
 			
 			# Stop sending if request is PAUSE or TEARDOWN
 			if self.clientInfo['event'].isSet(): 
@@ -119,17 +121,41 @@ class ServerWorker:
 			data = self.clientInfo['videoStream'].nextFrame()
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
+				frameLen = len(data)
 				try:
 					address = self.clientInfo['rtspSocket'][1][0]
 					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
+					# check fragment
+					if frameLen > self.MAX_PAYLOAD_SIZE:
+						self.sendFragment(data, frameLen, frameNumber, address, port)
+					else:
+						self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
 				except:
 					print("Connection Error")
 					#print('-'*60)
 					#traceback.print_exc(file=sys.stdout)
 					#print('-'*60)
 
-	def makeRtp(self, payload, frameNbr):
+	def sendFragment(self, frameData, frameLen, frameNbr, adrr, port):
+		# calculate total fragments
+		totalFragments = (frameLen + self.MAX_PAYLOAD_SIZE - 1) // self.MAX_PAYLOAD_SIZE
+
+		# create Fragment ID
+		fragmentID = getattr(self, "fragmentID", 0) + 1
+		self.fragmentID = fragmentID
+
+		for i in range(totalFragments):
+			start = i*self.MAX_PAYLOAD_SIZE
+			end = min(start + self.MAX_PAYLOAD_SIZE, frameLen)
+			payload = frameData[start:end]
+
+			# call make RTP
+			RtpPacket = self.makeRtp(payload, frameNbr, fragmentID, totalFragments, i)
+			self.clientInfo['rtpSocket'].sendto(RtpPacket, (adrr, port))
+
+			time.sleep(0.00001) # delay tranh nghen UDP
+			
+	def makeRtp(self, payload, frameNbr, fragmentID=0, totalFragments=1, fragNum=0):
 		"""RTP-packetize the video data."""
 		version = 2
 		padding = 0
@@ -142,7 +168,7 @@ class ServerWorker:
 		
 		rtpPacket = RtpPacket()
 		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
+		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, fragmentID, totalFragments, fragNum)
 		
 		return rtpPacket.getPacket()
 		

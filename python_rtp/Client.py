@@ -34,7 +34,7 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
-		
+		self.fragmentBuffer = {}
 	def createWidgets(self):
 		"""Build GUI."""
 		# Create Setup button
@@ -85,9 +85,9 @@ class Client:
 		"""Play button handler."""
 		if self.state == self.READY:
 			# Create a new thread to listen for RTP packets
-			threading.Thread(target=self.listenRtp).start()
 			self.playEvent = threading.Event()
 			self.playEvent.clear()
+			threading.Thread(target=self.listenRtp).start()
 			self.sendRtspRequest(self.PLAY)
 	
 	def listenRtp(self):		
@@ -98,13 +98,16 @@ class Client:
 				if data:
 					rtpPacket = RtpPacket()
 					rtpPacket.decode(data)
-					
-					currFrameNbr = rtpPacket.seqNum()
-					print("Current Seq Num: " + str(currFrameNbr))
-										
-					if currFrameNbr > self.frameNbr: # Discard the late packet
-						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+					# check if fragmentheader exist
+					if rtpPacket.isFragmented():
+						self.handleFragment(rtpPacket)
+					else:
+						currFrameNbr = rtpPacket.seqNum()
+						print("Current Seq Num: " + str(currFrameNbr))
+											
+						if currFrameNbr > self.frameNbr: # Discard the late packet
+							self.frameNbr = currFrameNbr
+							self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
 			except:
 				# Stop listening upon requesting PAUSE or TEARDOWN
 				if self.playEvent.isSet(): 
@@ -116,7 +119,42 @@ class Client:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
 					break
-					
+	def handleFragment(self, rtpPacket):
+		fragID = rtpPacket.getFragmentID()
+		total = rtpPacket.getTotalFragments()
+		num = rtpPacket.getFragNum()
+		
+		if fragID == 0: return # ID 0 thường là lỗi hoặc mặc định
+
+		print(f"Received Fragment: ID={fragID}, #{num}/{total}")
+		# Tạo dict con nếu chưa có
+		if fragID not in self.fragmentBuffer:
+			self.fragmentBuffer[fragID] = {}
+		
+		# Lưu payload
+		self.fragmentBuffer[fragID][num] = rtpPacket.getPayload()
+
+		# Kiểm tra đủ mảnh
+		if len(self.fragmentBuffer[fragID]) == total:
+			# Ghép mảnh
+			frame_data = b''
+			try:
+				for i in range(total):
+					frame_data += self.fragmentBuffer[fragID][i]
+				
+				# Xóa buffer đã dùng
+				del self.fragmentBuffer[fragID]
+				
+				# Hiển thị
+				self.updateMovie(self.writeFrame(frame_data))
+				
+				# Cập nhật seq number
+				seq = rtpPacket.seqNum()
+				if seq > self.frameNbr:
+					self.frameNbr = seq
+			except KeyError:
+				print("Missing fragment index, discarding frame")
+				del self.fragmentBuffer[fragID]
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
 		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
@@ -129,7 +167,10 @@ class Client:
 	def updateMovie(self, imageFile):
 		"""Update the image file as video frame in the GUI."""
 		photo = ImageTk.PhotoImage(Image.open(imageFile))
-		self.label.configure(image = photo, height=288) 
+		# Xóa 'height=288' để Label tự động giãn theo kích thước thật của Video HD
+		# self.label.configure(image = photo) 
+		# Nếu muốn an toàn hơn, reset height về None hoặc kích thước ảnh
+		self.label.configure(image = photo, height=photo.height()) 
 		self.label.image = photo
 		
 	def connectToServer(self):
